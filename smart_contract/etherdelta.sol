@@ -164,6 +164,8 @@ contract EtherDelta is SafeMath {
   event Trade(address tokenGet, uint amountGet, address tokenGive, uint amountGive, address get, address give);
   event Deposit(address token, address user, uint amount, uint balance);
   event Withdraw(address token, address user, uint amount, uint balance);
+  event MarginOrder(address debtToken, uint debtAmount, address collateralToken, uint expires, uint interestRate, uint marginLiquidationLevel, uint nonce, address user);
+  event MarginAccountOpened(address debtToken, uint debtAmount, address collateralToken, uint expires, uint interestRate, uint marginLiquidationLevel, uint nonce, address user, MarginAccount account);
 
   function EtherDelta(address admin_, address feeAccount_, address accountLevelsAddr_, uint feeMake_, uint feeTake_, uint feeRebate_) {
     admin = admin_;
@@ -308,5 +310,146 @@ contract EtherDelta is SafeMath {
     if (!(orders[msg.sender][hash] || ecrecover(sha3("\x19Ethereum Signed Message:\n32", hash),v,r,s) == msg.sender)) throw;
     orderFills[msg.sender][hash] = amountGet;
     Cancel(tokenGet, amountGet, tokenGive, amountGive, expires, nonce, msg.sender, v, r, s);
+  }
+
+  // Extracted function to avoid to "stack too deep" error
+  function substractBalance(address user, address token, uint amount) {
+    tokens[token][user] = safeSub(tokens[token][user], amount);
+  }
+
+  function openMarginAccount(address debtToken, uint debtAmount, address collateralToken, uint expires, uint interestRate, uint marginLiquidationLevel, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount) {
+    bytes32 hash = sha256(this, debtToken, debtAmount, collateralToken, expires, interestRate, marginLiquidationLevel, nonce);
+    if (!(
+      (orders[user][hash] || ecrecover(sha3("\x19Ethereum Signed Message:\n32", hash),v,r,s) == user) &&
+      block.number <= expires &&
+      safeAdd(orderFills[user][hash], amount) <= debtAmount
+    )) throw;
+
+    substractBalance(user, debtToken, amount);
+
+    MarginAccount account = new MarginAccount(user, msg.sender, debtToken, debtAmount, collateralToken, interestRate, marginLiquidationLevel, this);
+    // withdraw debt and collateral tokens from creditor & debtor
+
+    orderFills[user][hash] = safeAdd(orderFills[user][hash], amount);
+    MarginAccountOpened(debtToken, debtAmount, collateralToken, expires, interestRate, marginLiquidationLevel, nonce, user, account);
+  }
+
+  function marginOrder(address debtToken, uint debtAmount, address collateralToken, uint interestRate, uint marginLiquidationLevel, uint expires, uint nonce) {
+    bytes32 hash = sha256(this, debtToken, debtAmount, collateralToken, expires, interestRate, marginLiquidationLevel, nonce);
+    orders[msg.sender][hash] = true;
+    MarginOrder(debtToken, debtAmount, collateralToken, expires, interestRate, marginLiquidationLevel, nonce, msg.sender);
+  }
+}
+
+contract MarginAccount is SafeMath {
+  address public creditor;
+  address public debtor;
+  address public debtToken;
+  uint public debtAmount;
+  address public collateralToken;
+  uint public interestRate; // interest on the debt per block
+  uint public marginLiquidationLevel; // position can be liquidated if collateral value goes below this ratio
+  EtherDelta etherDelta; // exchange contract for determining the exchange rate
+  uint public lastInterestPaymentBlock; // the block where interest on the debt was last paid
+
+  event Deposit(address token, address user, uint amount, uint balance);
+  event Withdraw(address token, address user, uint amount, uint balance);
+
+  function MarginAccount(address creditor_, address debtor_, address debtToken_, uint debtAmount_, address collateralToken_, uint interestRate_, uint marginLiquidationLevel_, address etherDelta_) payable {
+      if (debtToken_ == collateralToken_) throw;
+      creditor = creditor_;
+      debtor = debtor_;
+      debtToken = debtToken_;
+      collateralToken = collateralToken_;
+      interestRate = interestRate_;
+      marginLiquidationLevel = marginLiquidationLevel_;
+      etherDelta = EtherDelta(etherDelta_);
+      lastInterestPaymentBlock = block.number;
+  }
+
+  function() {
+    throw;
+  }
+
+  function getCollateralAmount() private returns (uint value) {
+    address a = this;
+    if (collateralToken == 0) return a.balance;
+    else return Token(collateralToken).balanceOf(a);
+  }
+
+  function getDebtAssetAvailable() private returns (uint value) {
+    address a = this;
+    if (debtToken == 0) return a.balance;
+    else return Token(collateralToken).balanceOf(a);
+  }
+
+  function getExchangeRate() private returns (uint rate) {
+    return 1;
+    // TODO: estimate exchange rate based on recent trades on etherdelta
+  }
+
+  function collectInterest() {
+    // collect interest since lastInterestPaymentBlock, substract from collateral
+    if (lastInterestPaymentBlock == block.number) throw;
+    uint blocks = block.number - lastInterestPaymentBlock;
+    uint interest = safeMul(debtAmount, interestRate ** blocks);
+    uint collateralAmount = safeSub(collateralAmount, safeMul(interest, getExchangeRate()));
+    if (!Token(collateralToken).transferFrom(this, creditor, interest)) throw;
+    lastInterestPaymentBlock = block.number;
+  }
+
+  // Take an order to sell debt asset (short selling)
+  function sellDebtAsset(uint amountGet, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount, address etherDelta_) {
+    if (msg.sender != debtor) throw; // must be called by debtor
+    EtherDelta etherDelta = EtherDelta(etherDelta_);
+    etherDelta.trade(collateralToken, amountGet, debtToken, amountGive, expires, nonce, user, v, r, s, amount);
+  }
+
+  // Take an order to buy debt asset using collateral and pay back debt
+  function repayDebt(uint amountGet, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount, address etherDelta_) private {
+    if (msg.sender != creditor && msg.sender != debtor) throw;
+    EtherDelta etherDelta = EtherDelta(etherDelta_);
+    uint collateralValue = safeMul(getCollateralAmount(), getExchangeRate());
+    if (msg.sender == creditor && collateralValue > safeMul(marginLiquidationLevel, debtAmount)) throw; // Creditor can liquidate only if collateral value is low
+
+    // deposit collateral tokens to etherdelta
+    if (collateralToken == 0) etherDelta.deposit();
+    else etherDelta.depositToken(collateralToken, amount);
+
+    // trade collateral tokens for debt tokens
+    etherDelta.trade(collateralToken, amountGet, debtToken, amountGive, expires, nonce, user, v, r, s, amount);
+
+    // withdraw tokens from etherdelta
+    if (debtToken == 0) etherDelta.withdraw(amountGive);
+    else etherDelta.withdrawToken(debtToken, amountGive);
+
+    // repay debt
+    if (debtToken == 0) msg.sender.call.value(amount)(); // send ether
+    else Token(debtToken).transfer(creditor, amount); // send tokens
+
+    // substract from balances in this contract
+    debtAmount = safeSub(debtAmount, amountGive);
+  }
+
+  function depositCollateral(uint amount) payable {
+    if (collateralToken == 0) {
+      amount = msg.value;
+    } else {
+        //remember to call Token(address).approve(this, amount) or this contract will not be able to do the transfer on your behalf.
+        if (!Token(collateralToken).transferFrom(msg.sender, this, amount)) throw;
+    }
+    Deposit(collateralToken, msg.sender, amount, getCollateralAmount());
+  }
+
+  function withdrawCollateral(uint amount) { // TODO: minimum reserve check
+    uint collateralAmount = getCollateralAmount();
+    if (collateralAmount < amount) throw;
+    collateralAmount = safeSub(collateralAmount, amount);
+    if (collateralToken == 0) {
+        if (!msg.sender.call.value(amount)()) throw;
+    } else {
+        if (!Token(collateralToken).transfer(msg.sender, amount)) throw;
+    }
+    Withdraw(0, msg.sender, amount, collateralAmount);
   }
 }
