@@ -313,7 +313,7 @@ contract EtherDelta is SafeMath {
   }
 
   // Extracted function to avoid to "stack too deep" error
-  function substractBalance(address user, address token, uint amount) {
+  function substractBalance(address user, address token, uint amount) private {
     tokens[token][user] = safeSub(tokens[token][user], amount);
   }
 
@@ -385,15 +385,14 @@ contract MarginAccount is SafeMath {
 
   function getExchangeRate() private returns (uint rate) {
     return 1;
-    // TODO: estimate exchange rate based on recent trades on etherdelta
+    // TODO: estimate debtToken/collateralToken exchange rate based on recent trades or order book on etherdelta
   }
 
   function collectInterest() {
     // collect interest since lastInterestPaymentBlock, substract from collateral
     if (lastInterestPaymentBlock == block.number) throw;
     uint blocks = block.number - lastInterestPaymentBlock;
-    uint interest = safeMul(debtAmount, interestRate ** blocks);
-    uint collateralAmount = safeSub(collateralAmount, safeMul(interest, getExchangeRate()));
+    uint interest = safeMul(debtAmount, interestRate ** blocks) / getExchangeRate();
     if (!Token(collateralToken).transferFrom(this, creditor, interest)) throw;
     lastInterestPaymentBlock = block.number;
   }
@@ -441,8 +440,11 @@ contract MarginAccount is SafeMath {
     Deposit(collateralToken, msg.sender, amount, getCollateralAmount());
   }
 
-  function withdrawCollateral(uint amount) { // TODO: minimum reserve check
+  function withdrawCollateral(uint amount) {
     uint collateralAmount = getCollateralAmount();
+    uint exchangeRate = getExchangeRate();
+    uint excessCollateral = safeSub(safeMul(collateralAmount, exchangeRate), safeMul(debtAmount, marginLiquidationLevel)) / exchangeRate;
+    if (amount < 0 || amount > excessCollateral) throw; // minimum reserve check
     if (collateralAmount < amount) throw;
     collateralAmount = safeSub(collateralAmount, amount);
     if (collateralToken == 0) {
